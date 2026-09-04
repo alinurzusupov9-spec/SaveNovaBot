@@ -8,12 +8,13 @@ from typing import Optional
 
 import yt_dlp
 from dotenv import load_dotenv
-from telegram import Update
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ChatAction
 from telegram.ext import (
     Application,
     CommandHandler,
     MessageHandler,
+    CallbackQueryHandler,
     ContextTypes,
     filters,
 )
@@ -22,6 +23,7 @@ load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 MAX_FILE_SIZE_MB = 50
+QUALITY_TIERS = [2160, 1440, 1080, 720, 480, 360]
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -39,12 +41,13 @@ URL_PATTERN = re.compile(
 WELCOME_TEXT = (
     "Привет! Я SaveNovaBot.\n\n"
     "Пришли мне ссылку на видео из TikTok, Instagram Reels или YouTube Shorts, "
-    "и я скачаю его без водяного знака."
+    "выбери качество — и я скачаю его без водяного знака."
 )
 
 HELP_TEXT = (
     "Просто пришли ссылку на видео из TikTok, Instagram Reels или "
-    "YouTube Shorts — я отправлю тебе файл без водяного знака.\n\n"
+    "YouTube Shorts, выбери качество на кнопках — получишь файл без "
+    "водяного знака.\n\n"
     "Команды:\n"
     "/start — приветствие\n"
     "/help — эта справка"
@@ -64,12 +67,31 @@ def _extract_url(text: str) -> Optional[str]:
     return match.group(1) if match else None
 
 
-def _download_video(url: str, out_dir: str) -> Path:
+def _probe_heights(url: str) -> list[int]:
+    ydl_opts = {"quiet": True, "no_warnings": True, "skip_download": True}
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        info = ydl.extract_info(url, download=False)
+        formats = info.get("formats") or []
+        heights = set()
+        for f in formats:
+            h = f.get("height")
+            vcodec = f.get("vcodec")
+            if h and vcodec and vcodec != "none":
+                heights.add(h)
+        return sorted(heights, reverse=True)
+
+
+def _download_video(url: str, out_dir: str, height: Optional[int]) -> Path:
     outtmpl = os.path.join(out_dir, "%(id)s.%(ext)s")
+
+    if height:
+        fmt = f"bestvideo[height<={height}]+bestaudio/best[height<={height}]"
+    else:
+        fmt = "mp4/best"
 
     ydl_opts = {
         "outtmpl": outtmpl,
-        "format": "mp4/best",
+        "format": fmt,
         "merge_output_format": "mp4",
         "quiet": True,
         "no_warnings": True,
@@ -80,7 +102,12 @@ def _download_video(url: str, out_dir: str) -> Path:
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(url, download=True)
         filename = ydl.prepare_filename(info)
-        return Path(filename)
+        path = Path(filename)
+        if not path.exists():
+            alt = path.with_suffix(".mp4")
+            if alt.exists():
+                return alt
+        return path
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -93,19 +120,66 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         )
         return
 
-    status_msg = await update.message.reply_text("Скачиваю видео...")
-    await context.bot.send_chat_action(
-        chat_id=update.effective_chat.id, action=ChatAction.UPLOAD_VIDEO
-    )
+    status_msg = await update.message.reply_text("Смотрю доступные качества...")
+
+    try:
+        heights = await asyncio.to_thread(_probe_heights, url)
+    except Exception:
+        logger.exception("Probe failed for %s", url)
+        heights = []
+
+    available = [h for h in QUALITY_TIERS if any(abs(x - h) <= 40 for x in heights)]
+    available = available[:4]
+
+    context.user_data["pending_url"] = url
+
+    if not available:
+        await status_msg.edit_text("Скачиваю в лучшем доступном качестве...")
+        await _do_download(update, context, status_msg, url, None)
+        return
+
+    buttons = [
+        InlineKeyboardButton(
+            f"{h}p" + (" (4K)" if h >= 2160 else ""), callback_data=f"q:{h}"
+        )
+        for h in available
+    ]
+    buttons.append(InlineKeyboardButton("Оригинал", callback_data="q:0"))
+    keyboard = InlineKeyboardMarkup([buttons[i : i + 2] for i in range(0, len(buttons), 2)])
+
+    await status_msg.edit_text("Выбери качество:", reply_markup=keyboard)
+
+
+async def handle_quality_choice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+
+    url = context.user_data.get("pending_url")
+    if not url:
+        await query.edit_message_text("Ссылка устарела, пришли её заново.")
+        return
+
+    height_str = query.data.split(":", 1)[1]
+    height = int(height_str) if height_str != "0" else None
+
+    label = f"{height}p" if height else "оригинальном качестве"
+    await query.edit_message_text(f"Скачиваю в {label}...")
+
+    await _do_download(update, context, query.message, url, height)
+
+
+async def _do_download(update, context, status_msg, url: str, height: Optional[int]) -> None:
+    chat_id = update.effective_chat.id
+    await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.UPLOAD_VIDEO)
 
     with tempfile.TemporaryDirectory() as tmp_dir:
         try:
-            file_path = await asyncio.to_thread(_download_video, url, tmp_dir)
+            file_path = await asyncio.to_thread(_download_video, url, tmp_dir, height)
         except yt_dlp.utils.DownloadError as e:
             logger.warning("Download failed for %s: %s", url, e)
             await status_msg.edit_text(
-                "Не получилось скачать это видео. Возможно, оно приватное, "
-                "удалено или ссылка неверна."
+                "Не получилось скачать это видео в выбранном качестве. "
+                "Возможно, оно приватное, удалено или качество недоступно."
             )
             return
         except Exception:
@@ -121,13 +195,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         if size_mb > MAX_FILE_SIZE_MB:
             await status_msg.edit_text(
                 f"Видео весит {size_mb:.1f} МБ — это больше лимита в "
-                f"{MAX_FILE_SIZE_MB} МБ для прямой отправки ботом."
+                f"{MAX_FILE_SIZE_MB} МБ для прямой отправки ботом. "
+                f"Попробуй выбрать качество пониже."
             )
             return
 
         try:
             with open(file_path, "rb") as video_file:
-                await update.message.reply_video(
+                await context.bot.send_video(
+                    chat_id=status_msg.chat_id,
                     video=video_file,
                     caption="Готово! Без водяного знака.",
                     supports_streaming=True,
@@ -147,6 +223,7 @@ def main() -> None:
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    app.add_handler(CallbackQueryHandler(handle_quality_choice, pattern=r"^q:"))
 
     logger.info("SaveNovaBot запущен")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
