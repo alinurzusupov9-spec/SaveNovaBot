@@ -1,4 +1,4 @@
-import os
+    import os
 import re
 import logging
 import tempfile
@@ -67,7 +67,7 @@ def _extract_url(text: str) -> Optional[str]:
     return match.group(1) if match else None
 
 
-def _probe_heights(url: str) -> list[int]:
+def _probe(url: str) -> tuple[list[int], Optional[str]]:
     ydl_opts = {"quiet": True, "no_warnings": True, "skip_download": True}
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(url, download=False)
@@ -78,10 +78,11 @@ def _probe_heights(url: str) -> list[int]:
             vcodec = f.get("vcodec")
             if h and vcodec and vcodec != "none":
                 heights.add(h)
-        return sorted(heights, reverse=True)
+        title = info.get("title")
+        return sorted(heights, reverse=True), title
 
 
-def _download_video(url: str, out_dir: str, height: Optional[int]) -> Path:
+def _download_video(url: str, out_dir: str, height: Optional[int]) -> tuple[Path, Optional[str]]:
     outtmpl = os.path.join(out_dir, "%(id)s.%(ext)s")
 
     if height:
@@ -106,8 +107,9 @@ def _download_video(url: str, out_dir: str, height: Optional[int]) -> Path:
         if not path.exists():
             alt = path.with_suffix(".mp4")
             if alt.exists():
-                return alt
-        return path
+                path = alt
+        title = info.get("title")
+        return path, title
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -123,19 +125,20 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     status_msg = await update.message.reply_text("Смотрю доступные качества...")
 
     try:
-        heights = await asyncio.to_thread(_probe_heights, url)
+        heights, title = await asyncio.to_thread(_probe, url)
     except Exception:
         logger.exception("Probe failed for %s", url)
-        heights = []
+        heights, title = [], None
 
     available = [h for h in QUALITY_TIERS if any(abs(x - h) <= 40 for x in heights)]
     available = available[:4]
 
     context.user_data["pending_url"] = url
+    context.user_data["pending_title"] = title
 
     if not available:
         await status_msg.edit_text("Скачиваю в лучшем доступном качестве...")
-        await _do_download(update, context, status_msg, url, None)
+        await _do_download(update, context, status_msg, url, None, title)
         return
 
     buttons = [
@@ -147,7 +150,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     buttons.append(InlineKeyboardButton("Оригинал", callback_data="q:0"))
     keyboard = InlineKeyboardMarkup([buttons[i : i + 2] for i in range(0, len(buttons), 2)])
 
-    await status_msg.edit_text("Выбери качество:", reply_markup=keyboard)
+    caption = title or "Выбери качество:"
+    await status_msg.edit_text(f"{caption}\n\nВыбери качество:", reply_markup=keyboard)
 
 
 async def handle_quality_choice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -155,6 +159,7 @@ async def handle_quality_choice(update: Update, context: ContextTypes.DEFAULT_TY
     await query.answer()
 
     url = context.user_data.get("pending_url")
+    title = context.user_data.get("pending_title")
     if not url:
         await query.edit_message_text("Ссылка устарела, пришли её заново.")
         return
@@ -165,16 +170,20 @@ async def handle_quality_choice(update: Update, context: ContextTypes.DEFAULT_TY
     label = f"{height}p" if height else "оригинальном качестве"
     await query.edit_message_text(f"Скачиваю в {label}...")
 
-    await _do_download(update, context, query.message, url, height)
+    await _do_download(update, context, query.message, url, height, title)
 
 
-async def _do_download(update, context, status_msg, url: str, height: Optional[int]) -> None:
+async def _do_download(
+    update, context, status_msg, url: str, height: Optional[int], title: Optional[str]
+) -> None:
     chat_id = update.effective_chat.id
     await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.UPLOAD_VIDEO)
 
     with tempfile.TemporaryDirectory() as tmp_dir:
         try:
-            file_path = await asyncio.to_thread(_download_video, url, tmp_dir, height)
+            file_path, real_title = await asyncio.to_thread(
+                _download_video, url, tmp_dir, height
+            )
         except yt_dlp.utils.DownloadError as e:
             logger.warning("Download failed for %s: %s", url, e)
             await status_msg.edit_text(
@@ -200,12 +209,24 @@ async def _do_download(update, context, status_msg, url: str, height: Optional[i
             )
             return
 
+        bot_username = context.bot.username or "SaveNovaBot"
+        quality_label = f"{height}p" if height else "оригинал"
+        final_title = title or real_title or ""
+
+        caption_parts = []
+        if final_title:
+            caption_parts.append(final_title)
+        caption_parts.append(f"🔗 {url}")
+        caption_parts.append(f"📺 {quality_label}")
+        caption_parts.append(f"Скачано с @{bot_username}")
+        caption = "\n\n".join(caption_parts)
+
         try:
             with open(file_path, "rb") as video_file:
                 await context.bot.send_video(
                     chat_id=status_msg.chat_id,
                     video=video_file,
-                    caption="Готово! Без водяного знака.",
+                    caption=caption,
                     supports_streaming=True,
                 )
             await status_msg.delete()
@@ -231,3 +252,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+    
